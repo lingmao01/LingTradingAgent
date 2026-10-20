@@ -1,0 +1,894 @@
+"""Tests for the trade journal analyzer and its broker-format parsers.
+
+Covers ``src.tools.trade_journal_parsers`` (format detection, side/symbol
+normalization, market inference, end-to-end parse) and
+``src.tools.trade_journal_tool`` (FIFO pairing, profile/behavior metrics,
+filtering, and the analyze_trade_journal error/dispatch paths).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from src.tools.trade_journal_parsers import (
+    TradeRecord,
+    _infer_market_from_symbol,
+    _normalize_side,
+    _qualify_a_share,
+    _to_float,
+    load_dataframe,
+    parse_tonghuashun,
+    parse_eastmoney,
+    parse_futu,
+    parse_generic,
+    detect_format,
+    parse_file,
+    records_to_dataframe,
+)
+from src.tools.trade_journal_tool import (
+    _apply_filter,
+    _compute_behavior,
+    _compute_profile,
+    _disposition_effect,
+    analyze_trade_journal,
+    pair_trades_fifo,
+)
+
+
+def _rec(dt: str, symbol: str, side: str, qty: float, price: float, fee: float = 0.0) -> TradeRecord:
+    return TradeRecord(
+        datetime=dt,
+        symbol=symbol,
+        name="",
+        side=side,
+        quantity=qty,
+        price=price,
+        amount=qty * price,
+        fee=fee,
+        market="china_a",
+    )
+
+
+def _df(records: list[TradeRecord]) -> pd.DataFrame:
+    return records_to_dataframe(records)
+
+
+@pytest.fixture()
+def allow_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Allow analyze_trade_journal to read files under tmp_path."""
+    monkeypatch.setenv("VIBE_TRADING_ALLOWED_FILE_ROOTS", str(tmp_path))
+    return tmp_path
+
+
+# --------------------------------------------------------------------------
+# Parser pure helpers
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        ("600519", "600519.SH"),  # Shanghai main
+        ("688981", "688981.SH"),  # STAR
+        ("000001", "000001.SZ"),  # Shenzhen main
+        ("300750", "300750.SZ"),  # ChiNext
+        ("430139", "430139.BJ"),  # BSE (4-prefix)
+        ("830799", "830799.BJ"),  # BSE (8-prefix)
+        ("600519.SH", "600519.SH"),  # already qualified -> passthrough
+        ("1", "000001.SZ"),  # zero-padded to 6 then mapped
+    ],
+)
+def test_qualify_a_share(code: str, expected: str) -> None:
+    assert _qualify_a_share(code) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("买入", "buy"),
+        ("证券买入", "buy"),
+        ("B", "buy"),
+        ("long", "buy"),
+        (" Purchase ", "buy"),
+        ("buy-to-cover", "buy"),
+        ("卖出", "sell"),
+        ("证券卖出", "sell"),
+        ("融券卖出", "sell"),
+        ("S", "sell"),
+        ("short", "sell"),
+        (" SELL-SHORT ", "sell"),
+    ],
+)
+def test_normalize_side(raw: str, expected: str) -> None:
+    assert _normalize_side(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", "hold", "strong buy"])
+def test_normalize_side_rejects_missing_or_unknown(raw: object) -> None:
+    with pytest.raises(ValueError, match="side"):
+        _normalize_side(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "红利入账",
+        "红利",
+        "分红",
+        "分红入账",
+        "派息",
+        "股息入账",
+        "股息",
+        "现金分红",
+        "Dividend",
+        " Cash Dividend ",
+    ],
+)
+def test_normalize_side_dividend_tokens(raw: str) -> None:
+    assert _normalize_side(raw) == "dividend"
+
+
+@pytest.mark.parametrize(
+    "raw", ["红股入账", "转股入账", "配股缴款", "配股上市", "利息归本", "利息"]
+)
+def test_tonghuashun_corporate_action_rows_are_skipped(raw: str) -> None:
+    """Known non-trade corporate-action rows drop out instead of raising."""
+    df = pd.DataFrame([{
+        "成交时间": "2026-01-10 09:00:00", "证券代码": "600519", "证券名称": "贵州茅台",
+        "操作": raw, "成交数量": "100", "成交价格": "", "成交金额": "",
+        "手续费": "", "印花税": "", "过户费": "",
+    }])
+    assert parse_tonghuashun(df) == []
+
+
+@pytest.mark.parametrize(
+    "raw", ["stock dividend", "stock split", "bonus issue", "rights issue", "interest"]
+)
+def test_generic_corporate_action_rows_are_skipped(raw: str) -> None:
+    df = pd.DataFrame([{
+        "datetime": "2026-01-10 09:00:00", "symbol": "AAPL",
+        "side": raw, "quantity": "", "price": "",
+    }])
+    assert parse_generic(df) == []
+
+
+@pytest.mark.parametrize(
+    "symbol,expected",
+    [
+        ("00700.HK", "hk"),
+        ("600519.SH", "china_a"),
+        ("000001.SZ", "china_a"),
+        ("VOD.L", "uk"),
+        ("HSBA.L", "uk"),
+        ("BARC.L", "uk"),
+        ("vod.l", "uk"),
+        ("AAPL", "us"),
+        ("BTC-USDT", "crypto"),
+        ("ETH-USD", "crypto"),
+        ("BTCUSDT", "crypto"),
+        ("ethusdc", "crypto"),
+        ("SOLBUSD", "crypto"),
+        ("123456", "other"),
+    ],
+)
+def test_infer_market_from_symbol(symbol: str, expected: str) -> None:
+    assert _infer_market_from_symbol(symbol) == expected
+
+
+def test_detect_format_signatures() -> None:
+    ths = pd.DataFrame(columns=["成交时间", "证券代码", "操作", "成交数量"])
+    assert detect_format(ths) == "tonghuashun"
+
+    em = pd.DataFrame(columns=["成交日期", "买卖标志", "股票代码"])
+    assert detect_format(em) == "eastmoney"
+
+    futu = pd.DataFrame(columns=["Date", "Symbol", "Side", "Quantity"])
+    assert detect_format(futu) == "futu"
+
+    generic = pd.DataFrame(columns=["datetime", "ticker", "side"])
+    assert detect_format(generic) == "generic"
+
+    unknown = pd.DataFrame(columns=["foo", "bar"])
+    assert detect_format(unknown) == "unknown"
+
+
+def test_records_to_dataframe_sorts_and_handles_empty() -> None:
+    empty = records_to_dataframe([])
+    assert empty.empty
+    assert "datetime" in empty.columns
+
+    out = _df(
+        [
+            _rec("2026-01-03 10:00:00", "600519.SH", "buy", 100, 10),
+            _rec("2026-01-01 10:00:00", "600519.SH", "buy", 100, 9),
+        ]
+    )
+    # Sorted ascending by datetime.
+    assert list(out["price"]) == [9, 10]
+
+
+# --------------------------------------------------------------------------
+# parse_file end-to-end (CSV fixtures)
+# --------------------------------------------------------------------------
+
+
+def test_parse_file_generic_csv(tmp_path: Path) -> None:
+    csv = tmp_path / "generic.csv"
+    csv.write_text(
+        "datetime,symbol,side,quantity,price\n"
+        "2026-01-02 09:35:00,AAPL,buy,10,180\n"
+        "2026-01-05 14:00:00,AAPL,sell,10,190\n",
+        encoding="utf-8",
+    )
+    fmt, records = parse_file(csv)
+    assert fmt == "generic"
+    assert len(records) == 2
+    assert records[0].symbol == "AAPL"
+    assert records[0].side == "buy"
+    assert records[0].market == "us"
+
+
+def test_parse_file_tonghuashun_csv(tmp_path: Path) -> None:
+    csv = tmp_path / "ths.csv"
+    csv.write_text(
+        "成交时间,证券代码,证券名称,操作,成交数量,成交价格,成交金额,手续费,印花税,过户费\n"
+        "2026-01-02 09:35:00,600519,贵州茅台,买入,100,1700,170000,5,0,0.1\n"
+        "2026-01-08 10:00:00,600519,贵州茅台,卖出,100,1800,180000,5,180,0.1\n",
+        encoding="utf-8",
+    )
+    fmt, records = parse_file(csv)
+    assert fmt == "tonghuashun"
+    assert records[0].symbol == "600519.SH"  # qualified
+    assert records[0].side == "buy"
+    assert records[1].side == "sell"
+    # fee = 手续费 + 印花税 + 过户费
+    assert records[1].fee == pytest.approx(5 + 180 + 0.1)
+
+
+def test_parse_file_tonghuashun_dividend_and_bonus_rows(tmp_path: Path) -> None:
+    """A 红利入账 row used to kill the whole parse with "Unsupported trade side"."""
+    csv = tmp_path / "ths_dividend.csv"
+    csv.write_text(
+        "成交时间,证券代码,证券名称,操作,成交数量,成交价格,成交金额,手续费,印花税,过户费\n"
+        "2026-01-02 09:35:00,600519,贵州茅台,买入,100,1700,170000,5,0,0.1\n"
+        "2026-01-10 09:00:00,600519,贵州茅台,红利入账,,,500,0,0,0\n"
+        "2026-01-12 09:00:00,600519,贵州茅台,红股入账,10,,,0,0,0\n",
+        encoding="utf-8",
+    )
+    fmt, records = parse_file(csv)
+    assert fmt == "tonghuashun"
+    # The bonus-share row is dropped; the dividend row keeps its cash in amount.
+    assert [r.side for r in records] == ["buy", "dividend"]
+    dividend = records[1]
+    assert dividend.symbol == "600519.SH"
+    assert dividend.amount == 500.0
+    assert dividend.quantity == 0.0
+
+
+def test_parse_futu_dividend_row_carries_cash_amount() -> None:
+    df = pd.DataFrame([
+        {
+            "Date": "2026-01-02", "Time": "10:00:00", "Symbol": "AAPL",
+            "Name": "Apple", "Side": "Buy", "Quantity": "10", "Price": "180",
+            "Amount": "1800", "Commission": "1", "Platform Fee": "0",
+        },
+        {
+            "Date": "2026-01-10", "Time": "", "Symbol": "AAPL",
+            "Name": "Apple", "Side": "Dividend", "Quantity": "", "Price": "",
+            "Amount": "25.5", "Commission": "", "Platform Fee": "",
+        },
+    ])
+    records = parse_futu(df)
+    assert [r.side for r in records] == ["buy", "dividend"]
+    assert records[1].amount == 25.5
+    assert records[1].quantity == 0.0
+    assert records[1].market == "us"
+
+
+def test_parse_file_unknown_raises(tmp_path: Path) -> None:
+    csv = tmp_path / "weird.csv"
+    csv.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unrecognized"):
+        parse_file(csv)
+
+
+def test_load_dataframe_accepts_utf16_bom_csv(tmp_path: Path) -> None:
+    # Excel "CSV UTF-16" / Unicode CSV exports a BOM; previously every
+    # encoding attempt raised UnicodeDecodeError and the load failed.
+    csv = tmp_path / "futu_utf16.csv"
+    body = "Date,Symbol,Side,Quantity,Price\n2024-01-02,AAPL,Buy,10,100\n"
+    csv.write_bytes(body.encode("utf-16"))
+    df = load_dataframe(csv)
+    assert list(df.columns) == ["Date", "Symbol", "Side", "Quantity", "Price"]
+    assert detect_format(df) == "futu"
+    assert df.iloc[0]["Symbol"] == "AAPL"
+
+
+@pytest.mark.parametrize(
+    "header,value,error",
+    [
+        ("datetime,symbol,quantity,price", "2026-01-02,AAPL,10,180", "requires a side"),
+        ("datetime,symbol,side,quantity,price", "2026-01-02,AAPL,hold,10,180", "Unsupported trade side"),
+    ],
+)
+def test_parse_file_rejects_missing_or_unknown_side(
+    tmp_path: Path, header: str, value: str, error: str
+) -> None:
+    csv = tmp_path / "invalid_side.csv"
+    csv.write_text(f"{header}\n{value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        parse_file(csv)
+
+
+# --------------------------------------------------------------------------
+# FIFO pairing
+# --------------------------------------------------------------------------
+
+
+def test_fifo_single_roundtrip_pnl() -> None:
+    rts = pair_trades_fifo(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "600519.SH", "buy", 100, 10),
+                _rec("2026-01-11 10:00:00", "600519.SH", "sell", 100, 12),
+            ]
+        )
+    )
+    assert len(rts) == 1
+    trip = rts[0]
+    assert trip["pnl"] == 200.0  # (12-10)*100
+    assert trip["pnl_pct"] == 0.2  # 200 / (10*100)
+    assert trip["hold_days"] == 10.0
+    assert trip["qty"] == 100
+
+
+def test_fifo_fee_allocation() -> None:
+    rts = pair_trades_fifo(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "X.SH", "buy", 100, 10, fee=10),
+                _rec("2026-01-02 10:00:00", "X.SH", "sell", 100, 12, fee=6),
+            ]
+        )
+    )
+    # gross 200 - buy_fee 10 - sell_fee 6 = 184
+    assert rts[0]["pnl"] == 184.0
+
+
+def test_fifo_partial_fill_splits_into_two_roundtrips() -> None:
+    rts = pair_trades_fifo(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "X.SH", "buy", 100, 10),
+                _rec("2026-01-02 10:00:00", "X.SH", "buy", 100, 20),
+                _rec("2026-01-03 10:00:00", "X.SH", "sell", 150, 30),
+            ]
+        )
+    )
+    # FIFO: 100 @10 fully, then 50 @20.
+    assert len(rts) == 2
+    assert rts[0]["qty"] == 100
+    assert rts[0]["pnl"] == 2000.0  # (30-10)*100
+    assert rts[1]["qty"] == 50
+    assert rts[1]["pnl"] == 500.0  # (30-20)*50
+
+
+@pytest.mark.parametrize("exit_quantities", [[5, 5], [4, 4, 4]])
+def test_fifo_partial_exits_conserve_entry_fee(exit_quantities: list[int]) -> None:
+    entry_qty = sum(exit_quantities)
+    records = [
+        _rec(
+            "2026-01-01 10:00:00",
+            "X.SH",
+            "buy",
+            entry_qty,
+            10,
+            fee=entry_qty,
+        )
+    ]
+    records.extend(
+        _rec(
+            f"2026-01-0{day} 10:00:00",
+            "X.SH",
+            "sell",
+            qty,
+            11,
+        )
+        for day, qty in enumerate(exit_quantities, start=2)
+    )
+
+    rts = pair_trades_fifo(_df(records))
+    gross_pnl = sum((trip["sell_price"] - trip["buy_price"]) * trip["qty"] for trip in rts)
+    allocated_entry_fee = gross_pnl - sum(trip["pnl"] for trip in rts)
+
+    assert allocated_entry_fee == pytest.approx(entry_qty)
+    assert sum(trip["pnl"] for trip in rts) == pytest.approx(0.0)
+
+
+def test_fifo_unmatched_sell_ignored() -> None:
+    rts = pair_trades_fifo(
+        _df([_rec("2026-01-01 10:00:00", "X.SH", "sell", 100, 12)])
+    )
+    assert rts == []
+
+
+# --------------------------------------------------------------------------
+# Profile / behavior
+# --------------------------------------------------------------------------
+
+
+def test_compute_profile_win_rate_and_pnl() -> None:
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),  # +200 win
+                _rec("2026-01-02 10:00:00", "B.SH", "buy", 100, 50),
+                _rec("2026-01-06 10:00:00", "B.SH", "sell", 100, 45),  # -500 loss
+            ]
+        )
+    )
+    assert profile["total_roundtrips"] == 2
+    assert profile["win_rate"] == 0.5
+    assert profile["total_pnl"] == -300.0  # 200 - 500
+
+
+def _dividend_rec(dt: str, symbol: str, amount: float, market: str = "china_a") -> TradeRecord:
+    return TradeRecord(
+        datetime=dt,
+        symbol=symbol,
+        name="",
+        side="dividend",
+        quantity=0.0,
+        price=0.0,
+        amount=amount,
+        fee=0.0,
+        market=market,
+    )
+
+
+def test_compute_profile_dividend_rows() -> None:
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),  # +200 win
+                _dividend_rec("2026-01-10 09:00:00", "A.SH", 500.0),
+            ]
+        )
+    )
+    assert profile["total_trades"] == 2  # the dividend row is not a trade
+    assert profile["total_roundtrips"] == 1
+    assert profile["total_dividends"] == 500.0
+    assert profile["total_pnl"] == 700.0  # 200 roundtrip + 500 dividend
+    # A 09:00 dividend row must not leak into the trading-activity stats.
+    assert profile["market_distribution"] == {"china_a": 2}
+    assert profile["hourly_distribution"] == {10: 2}
+    # Nor into the per-symbol trade count and turnover.
+    assert profile["top_symbols"] == [{"symbol": "A.SH", "trades": 2, "total_amount": 2200.0}]
+
+
+def test_compute_profile_without_dividends_is_unchanged() -> None:
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+            ]
+        )
+    )
+    assert profile["total_dividends"] == 0.0
+    assert profile["total_pnl"] == 200.0
+
+
+def test_compute_profile_empty() -> None:
+    assert _compute_profile(records_to_dataframe([])) == {"error": "empty trade journal"}
+
+
+def test_disposition_effect_flags_holding_losers_longer() -> None:
+    rts_df = pd.DataFrame(
+        [
+            {"pnl": 100.0, "hold_days": 2.0},  # winner held 2d
+            {"pnl": -80.0, "hold_days": 10.0},  # loser held 10d
+        ]
+    )
+    out = _disposition_effect(rts_df)
+    assert out["ratio_loss_to_win_hold"] == 5.0  # 10 / 2
+    assert out["severity"] == "high"
+
+
+def test_disposition_effect_insufficient_data() -> None:
+    only_wins = pd.DataFrame([{"pnl": 10.0, "hold_days": 1.0}])
+    assert _disposition_effect(only_wins)["severity"] == "low"
+
+
+def test_compute_behavior_returns_all_four_diagnostics() -> None:
+    behavior = _compute_behavior(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+            ]
+        )
+    )
+    assert set(behavior) == {
+        "disposition_effect",
+        "overtrading",
+        "chasing_momentum",
+        "anchoring",
+    }
+
+
+# --------------------------------------------------------------------------
+# _apply_filter
+# --------------------------------------------------------------------------
+
+
+def _filter_df() -> pd.DataFrame:
+    return _df(
+        [
+            _rec("2026-01-02 10:00:00", "600519.SH", "buy", 100, 10),
+            _rec("2026-02-15 10:00:00", "AAPL", "buy", 10, 180),
+            _rec("2026-03-20 10:00:00", "600519.SH", "sell", 100, 12),
+        ]
+    )
+
+
+def test_apply_filter_date_range() -> None:
+    out = _apply_filter(_filter_df(), "2026-02-01 to 2026-02-28")
+    assert len(out) == 1
+    assert out.iloc[0]["symbol"] == "AAPL"
+
+
+def test_apply_filter_month_range_includes_entire_leap_month() -> None:
+    df = _df(
+        [
+            _rec("2024-01-31 10:00:00", "JAN", "buy", 1, 10),
+            _rec("2024-02-01 10:00:00", "FEB1", "buy", 1, 10),
+            _rec("2024-02-29 10:00:00", "FEB29", "buy", 1, 10),
+            _rec("2024-03-01 10:00:00", "MAR", "buy", 1, 10),
+        ]
+    )
+
+    out = _apply_filter(df, "2024-01 to 2024-02")
+
+    assert list(out["symbol"]) == ["JAN", "FEB1", "FEB29"]
+
+
+def test_apply_filter_preserves_full_date_and_mixed_precision() -> None:
+    df = _df(
+        [
+            _rec("2024-02-01 10:00:00", "START", "buy", 1, 10),
+            _rec("2024-02-15 10:00:00", "MIDDLE", "buy", 1, 10),
+            _rec("2024-02-29 10:00:00", "END", "buy", 1, 10),
+        ]
+    )
+
+    dates = _apply_filter(df, "2024-02-01 to 2024-02-15")
+    mixed = _apply_filter(df, "2024-02-15 to 2024-02")
+
+    assert list(dates["symbol"]) == ["START", "MIDDLE"]
+    assert list(mixed["symbol"]) == ["MIDDLE", "END"]
+    # Inverted/degenerate ranges now fail fast rather than silently returning
+    # an empty frame that a caller could mistake for "no trades in range" (#729).
+    with pytest.raises(ValueError, match="inverted date filter"):
+        _apply_filter(df, "2024-03 to 2024-02")
+
+
+def test_apply_filter_symbol_equals() -> None:
+    out = _apply_filter(_filter_df(), "symbol=600519.SH")
+    assert len(out) == 2
+    assert set(out["symbol"]) == {"600519.SH"}
+
+
+def test_apply_filter_empty_expr_is_noop() -> None:
+    df = _filter_df()
+    assert len(_apply_filter(df, "")) == len(df)
+
+
+# --------------------------------------------------------------------------
+# analyze_trade_journal dispatch + error paths
+# --------------------------------------------------------------------------
+
+
+def test_analyze_missing_file(allow_tmp: Path) -> None:
+    result = json.loads(analyze_trade_journal(str(allow_tmp / "does_not_exist_12345.csv")))
+    assert result["status"] == "error"
+    assert "not found" in result["error"].lower()
+
+
+def test_analyze_unsupported_extension(allow_tmp: Path) -> None:
+    bad = allow_tmp / "trades.txt"
+    bad.write_text("whatever", encoding="utf-8")
+    result = json.loads(analyze_trade_journal(str(bad)))
+    assert result["status"] == "error"
+    assert "extension" in result["error"].lower()
+
+
+def _write_full_journal(tmp_path: Path) -> Path:
+    csv = tmp_path / "full.csv"
+    csv.write_text(
+        "datetime,symbol,side,quantity,price\n"
+        "2026-01-02 09:35:00,600519.SH,buy,100,10\n"
+        "2026-01-09 14:00:00,600519.SH,sell,100,12\n",
+        encoding="utf-8",
+    )
+    return csv
+
+
+def test_analyze_full_includes_profile_and_behavior(allow_tmp: Path) -> None:
+    result = json.loads(analyze_trade_journal(str(_write_full_journal(allow_tmp))))
+    assert result["status"] == "ok"
+    assert result["total_records"] == 2
+    assert "profile" in result
+    assert "behavior" in result
+    assert result["profile"]["total_pnl"] == 200.0
+
+
+def test_analyze_strategy_is_pending_placeholder(allow_tmp: Path) -> None:
+    result = json.loads(
+        analyze_trade_journal(str(_write_full_journal(allow_tmp)), analysis_type="strategy")
+    )
+    assert result["status"] == "ok"
+    assert result["strategy_features"]["status"] == "pending"
+    # profile/behavior should not be attached for a strategy-only request.
+    assert "profile" not in result
+    assert "behavior" not in result
+
+
+def test_analyze_profile_only(allow_tmp: Path) -> None:
+    result = json.loads(
+        analyze_trade_journal(str(_write_full_journal(allow_tmp)), analysis_type="profile")
+    )
+    assert result["status"] == "ok"
+    assert "profile" in result
+    assert "behavior" not in result
+
+
+def test_analyze_with_filter(allow_tmp: Path) -> None:
+    csv = allow_tmp / "multi.csv"
+    csv.write_text(
+        "datetime,symbol,side,quantity,price\n"
+        "2026-01-02 09:35:00,600519.SH,buy,100,10\n"
+        "2026-02-09 14:00:00,AAPL,buy,10,180\n",
+        encoding="utf-8",
+    )
+    result = json.loads(
+        analyze_trade_journal(str(csv), filter_expr="symbol=AAPL")
+    )
+    assert result["status"] == "ok"
+    assert result["total_records"] == 1
+    assert result["filter_applied"] == "symbol=AAPL"
+
+
+def test_analyze_with_inverted_date_filter_returns_error_envelope(allow_tmp: Path) -> None:
+    """An inverted date range must surface as an error envelope, not a raw raise."""
+    result = json.loads(
+        analyze_trade_journal(
+            str(_write_full_journal(allow_tmp)), filter_expr="2026-03 to 2026-01"
+        )
+    )
+    assert result["status"] == "error"
+    assert "inverted date filter" in result["error"]
+
+
+def test_qualify_a_share_rejects_empty() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        _qualify_a_share("")
+    with pytest.raises(ValueError, match="empty"):
+        _qualify_a_share("   ")
+
+
+def test_parse_tonghuashun_skips_blank_code_rows() -> None:
+    df = pd.DataFrame([{
+        "成交时间": "2024-01-01 10:00:00", "证券代码": "", "证券名称": "",
+        "操作": "买入", "成交数量": 100, "成交价格": 10.0, "成交金额": 1000,
+        "手续费": 0, "印花税": 0, "过户费": 0,
+    }, {
+        "成交时间": "2024-01-01 10:01:00", "证券代码": "600519", "证券名称": "茅台",
+        "操作": "买入", "成交数量": 100, "成交价格": 10.0, "成交金额": 1000,
+        "手续费": 0, "印花税": 0, "过户费": 0,
+    }])
+    rec = parse_tonghuashun(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "600519.SH"
+
+
+def test_qualify_a_share_rejects_nan() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        _qualify_a_share(float("nan"))
+
+
+def test_parse_tonghuashun_skips_nan_code_rows() -> None:
+    df = pd.DataFrame([{
+        "成交时间": "2024-01-01 10:00:00", "证券代码": float("nan"), "证券名称": "",
+        "操作": "买入", "成交数量": 100, "成交价格": 10.0, "成交金额": 1000,
+        "手续费": 0, "印花税": 0, "过户费": 0,
+    }, {
+        "成交时间": "2024-01-01 10:01:00", "证券代码": "600519", "证券名称": "茅台",
+        "操作": "买入", "成交数量": 100, "成交价格": 10.0, "成交金额": 1000,
+        "手续费": 0, "印花税": 0, "过户费": 0,
+    }])
+    rec = parse_tonghuashun(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "600519.SH"
+
+
+def test_parse_eastmoney_skips_nan_code_rows() -> None:
+    df = pd.DataFrame([{
+        "成交日期": "20240101", "成交时间": "10:00:00", "股票代码": float("nan"),
+        "股票名称": "", "买卖标志": "B", "成交数量": 100, "成交均价": 10.0,
+        "成交金额": 1000, "佣金": 0, "印花税": 0,
+    }, {
+        "成交日期": "20240101", "成交时间": "10:01:00", "股票代码": "000001",
+        "股票名称": "平安", "买卖标志": "B", "成交数量": 100, "成交均价": 10.0,
+        "成交金额": 1000, "佣金": 0, "印花税": 0,
+    }])
+    rec = parse_eastmoney(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "000001.SZ"
+
+
+def test_parse_futu_skips_nan_symbol_rows() -> None:
+    """NaN Symbol cells must not become literal "NAN" US trades."""
+    df = pd.DataFrame([{
+        "Date": "2024-01-01", "Time": "10:00:00", "Symbol": float("nan"),
+        "Name": "", "Side": "Buy", "Quantity": 100, "Price": 10.0,
+        "Amount": 1000, "Commission": 0, "Platform Fee": 0,
+    }, {
+        "Date": "2024-01-01", "Time": "10:01:00", "Symbol": "AAPL",
+        "Name": "Apple", "Side": "Buy", "Quantity": 100, "Price": 10.0,
+        "Amount": 1000, "Commission": 0, "Platform Fee": 0,
+    }])
+    rec = parse_futu(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "AAPL"
+    assert rec[0].market == "us"
+
+
+def test_parse_generic_skips_nan_symbol_rows() -> None:
+    """Blank/NaN symbol cells are dropped instead of stringified to "nan"."""
+    df = pd.DataFrame([{
+        "datetime": "2024-01-01 10:00:00", "symbol": float("nan"),
+        "side": "buy", "quantity": 100, "price": 10.0,
+    }, {
+        "datetime": "2024-01-01 10:01:00", "symbol": "AAPL",
+        "side": "buy", "quantity": 100, "price": 10.0,
+    }])
+    rec = parse_generic(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "AAPL"
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (600519.0, "600519.SH"),
+        ("600519.0", "600519.SH"),
+        ("6.00519E+5", "600519.SH"),
+        ("6.00519e5", "600519.SH"),
+        ("000001.0", "000001.SZ"),
+        ("600519.SH", "600519.SH"),  # still passthrough
+    ],
+)
+def test_qualify_a_share_normalizes_float_stringified_codes(
+    code: object, expected: str
+) -> None:
+    """Excel/CSV float forms must not be treated as exchange-qualified."""
+    assert _qualify_a_share(code) == expected  # type: ignore[arg-type]
+
+
+def test_parse_tonghuashun_float_code_cell() -> None:
+    df = pd.DataFrame([{
+        "成交时间": "2024-01-01 10:00:00", "证券代码": 600519.0, "证券名称": "茅台",
+        "操作": "买入", "成交数量": 100, "成交价格": 10.0, "成交金额": 1000,
+        "手续费": 0, "印花税": 0, "过户费": 0,
+    }])
+    rec = parse_tonghuashun(df)
+    assert len(rec) == 1
+    assert rec[0].symbol == "600519.SH"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("$1,234.56", 1234.56),
+        ("USD 12.5", 12.5),
+        ("€99.00", 99.0),
+        ("¥1,000", 1000.0),
+        ("\u221212.5", -12.5),
+        ("CNY12.5", 12.5),
+    ],
+)
+def test_to_float_strips_currency_and_unicode_minus(raw: str, expected: float) -> None:
+    """US/EU/Asia broker cells with currency glyphs must not become 0.0."""
+    assert _to_float(raw) == expected
+
+
+def test_parse_generic_currency_price_not_zero() -> None:
+    df = pd.DataFrame([{
+        "datetime": "2024-01-02 10:00:00",
+        "symbol": "AAPL",
+        "side": "buy",
+        "quantity": "10",
+        "price": "$150.25",
+        "fee": "$1.00",
+    }])
+    rec = parse_generic(df)
+    assert len(rec) == 1
+    assert rec[0].price == 150.25
+    assert rec[0].fee == 1.0
+    assert rec[0].amount == 1502.5
+
+
+# ── M3d: a dividend's cash may not live in the fill column ────────────────
+
+
+def test_dividend_cash_read_from_a_cash_movement_column(tmp_path: Path) -> None:
+    """A 红利入账 row books its payout even when 成交金额 is not where it sits.
+
+    A dividend row has no quantity and no price, so the usual
+    ``成交金额 or qty * price`` fallback collapses to 0.0. Brokers book the
+    payout under a cash-movement heading instead, and reading only the fill
+    column would record the dividend as 0 silently — the exact
+    "run succeeded, number is zero" shape #1207 item 15 is about.
+    """
+    for cash_column in ("发生金额", "资金发生额", "红利金额", "实发金额"):
+        csv = tmp_path / f"ths_{cash_column}.csv"
+        csv.write_text(
+            "成交时间,证券代码,证券名称,操作,成交数量,成交价格,成交金额,"
+            f"{cash_column},手续费,印花税,过户费\n"
+            "2026-01-02 09:35:00,600519,贵州茅台,买入,100,1700,170000,0,5,0,0.1\n"
+            "2026-01-08 10:00:00,600519,贵州茅台,卖出,100,1800,180000,0,5,180,0.1\n"
+            # the fill column is empty for a payout; the money is in the other one
+            "2026-01-10 09:00:00,600519,贵州茅台,红利入账,0,0,0,500,0,0,0\n",
+            encoding="utf-8",
+        )
+
+        _fmt, records = parse_file(csv)
+        payouts = [r for r in records if r.side == "dividend"]
+        assert len(payouts) == 1, cash_column
+        assert payouts[0].amount == pytest.approx(500.0), (
+            f"{cash_column}: dividend cash silently booked as {payouts[0].amount}"
+        )
+
+
+def test_unreadable_dividend_cash_is_surfaced_not_silently_zero() -> None:
+    """A zero-cash dividend row must be counted, not averaged in as a real 0.
+
+    If a broker names the cash column something none of the parsers know, the
+    payout still cannot be read — but the caller has to be able to SEE that,
+    rather than trust a total that quietly omits the money.
+    """
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+                _dividend_rec("2026-01-10 09:00:00", "A.SH", 0.0),
+                _dividend_rec("2026-01-11 09:00:00", "A.SH", 500.0),
+            ]
+        )
+    )
+    assert profile["dividend_rows_missing_cash"] == 1
+    assert profile["total_dividends"] == 500.0
+    assert profile["total_pnl"] == 700.0
+
+
+def test_clean_journal_reports_no_missing_dividend_cash() -> None:
+    """The counter must not fire on a journal that parsed correctly."""
+    profile = _compute_profile(
+        _df(
+            [
+                _rec("2026-01-01 10:00:00", "A.SH", "buy", 100, 10),
+                _rec("2026-01-05 10:00:00", "A.SH", "sell", 100, 12),
+                _dividend_rec("2026-01-10 09:00:00", "A.SH", 500.0),
+            ]
+        )
+    )
+    assert profile["dividend_rows_missing_cash"] == 0

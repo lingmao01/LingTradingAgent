@@ -1,0 +1,192 @@
+name: Build and Push Docker Image
+
+# Actions are pinned to immutable commit SHAs, matching every other workflow in
+# this repository. The docker/* actions were moved to v4/v6/v7 in #1359; every
+# input this workflow passes was checked against each new major's action.yml at
+# the pinned SHA before the bump landed.
+#
+# The publish job runs on workflow_dispatch only, so it is exercised roughly
+# once per release. That is why `validate-build` below exists: a bad pin or a
+# broken Dockerfile would otherwise be discovered by whoever is mid-release,
+# not by CI. It runs the SAME four actions with `push: false`, on every change
+# to the Dockerfile, this workflow, or the packaging metadata.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag (e.g., v1.0.0, latest)'
+        required: true
+        default: 'latest'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker-build.yml'
+      - 'pyproject.toml'
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker-build.yml'
+      - 'pyproject.toml'
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  DOCKERHUB_REGISTRY: docker.io
+  GHCR_IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
+jobs:
+  # Exercises the pinned docker/* actions and the Dockerfile without pushing
+  # anything. Single platform on purpose: this is a "does it still build and do
+  # the actions still accept these inputs" check, not a release build, and
+  # emulating arm64 here would triple the runtime for no extra signal.
+  validate-build:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Extract metadata
+        id: meta-validate
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+          tags: |
+            type=raw,value=ci-validate
+
+      - name: Build without pushing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ steps.meta-validate.outputs.tags }}
+          labels: ${{ steps.meta-validate.outputs.labels }}
+          # Deliberately no GitHub Actions cache here. `type=gha` export needs
+          # a wider token than this job's `contents: read`, and a cache
+          # misconfiguration failing the run would make the check a source of
+          # false alarms rather than a guard. This job is path-filtered and
+          # rare; a cold build is the cheaper trade.
+
+  build-and-push:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Validate image tag
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          # Fail early with a readable message rather than at the registry push.
+          if ! printf '%s' "$IMAGE_TAG" | grep -qE '^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'; then
+            echo "::error::'$IMAGE_TAG' is not a valid Docker tag." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.DOCKERHUB_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=raw,value=latest,enable=${{ inputs.image_tag != 'latest' }}
+
+      - name: Extract metadata for Docker Hub
+        id: meta-dockerhub
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=raw,value=latest,enable=${{ inputs.image_tag != 'latest' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dockerhub.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE_NAME }}
+          readme-filepath: ./README.md
+          short-description: "AI trading agent with backtesting. Includes Telegram & Feishu channels."
+
+      - name: Summary
+        # Inputs go through env, never straight into the script body: a
+        # workflow_dispatch input interpolated into `run:` is a shell-injection
+        # vector even when only maintainers can dispatch it.
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GHCR_IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+        run: |
+          {
+            echo "### Docker Images Built and Pushed"
+            echo ""
+            echo "**GHCR:** \`${GHCR_IMAGE}:${IMAGE_TAG}\`"
+            echo "**Docker Hub:** \`${DOCKERHUB_IMAGE}:${IMAGE_TAG}\`"
+            echo ""
+            echo "**Platforms:** linux/amd64, linux/arm64"
+            echo "**Channels:** feishu, telegram (from requirements-channels-lock.txt)"
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR_IMAGE}:${IMAGE_TAG}"
+            echo '```'
+            echo ""
+            echo "> A newly created GHCR package is **private by default**. Until its"
+            echo "> visibility is set to public once in the org package settings, the"
+            echo "> pull above works only for authenticated users with read access."
+          } >> "$GITHUB_STEP_SUMMARY"

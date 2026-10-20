@@ -1,0 +1,102 @@
+version: 2
+updates:
+  # Root Python project (pyproject.toml).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      # Minor/patch bumps are low-risk and reviewed as a single batch; majors
+      # are excluded so they still arrive individually and get real scrutiny
+      # (a batched PR mixing 10 patch bumps with 1 breaking major is worse
+      # than either alone — you can't reject just the major).
+      pip-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+    ignore:
+      # pandas 3.x has real breaking changes (Copy-on-Write always-on, removed
+      # deprecated APIs) we haven't vetted; the <3.0.0 ceiling is deliberate,
+      # not an oversight. Revisit as a dedicated migration, not a dep bump.
+      - dependency-name: "pandas"
+        update-types: ["version-update:semver-major"]
+      # aiofile 3.12.3 requires caio~=0.12.0. Allow compatible caio patch
+      # updates, but suppress 0.13+ until aiofile widens the accepted series.
+      - dependency-name: "caio"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # websockets is likewise capped by our tree: langgraph-sdk 0.4.2 requires
+      # websockets<16, so a bump to 16.x is unresolvable. Drop this once
+      # langgraph-sdk widens its range.
+      - dependency-name: "websockets"
+      # ccxt 4.5.71 still exact-pins most of its transitive closure, and every
+      # package below is held at precisely the version declared by ccxt. They
+      # cannot move independently, so a Dependabot PR touching any of them is
+      # unmergeable by construction: PR #882 proposed five and died with
+      # ResolutionImpossible. ccxt 4.5.71 switched requests, cryptography,
+      # aiohttp, and yarl to compatible ranges and stopped declaring setuptools;
+      # those packages are intentionally no longer ignored so security updates
+      # can move them without waiting for another ccxt release.
+      #
+      # This suppresses only the automated PRs. Dependabot *alerts* come from
+      # the dependency graph and are unaffected by this file, so a CVE in
+      # an exact-pinned package below still surfaces in the Security tab; the
+      # remedy there is to bump ccxt, which carries the pinned version.
+      # Drop an entry here if ccxt ever loosens that pin.
+      - dependency-name: "aiohappyeyeballs"
+      - dependency-name: "aiohttp-fast-zlib"
+      - dependency-name: "aiosignal"
+      - dependency-name: "attrs"
+      - dependency-name: "certifi"
+      - dependency-name: "cffi"
+      - dependency-name: "charset-normalizer"
+      - dependency-name: "coincurve"
+      - dependency-name: "frozenlist"
+      - dependency-name: "idna"
+      - dependency-name: "multidict"
+      - dependency-name: "orjson"
+      - dependency-name: "propcache"
+      - dependency-name: "pycparser"
+      - dependency-name: "typing-extensions"
+      - dependency-name: "urllib3"
+      - dependency-name: "uvloop"
+      - dependency-name: "zlib-ng"
+      # pydantic-core is exact-pinned by pydantic (``pydantic-core==2.46.4``),
+      # so it only ever moves as part of a pydantic release. It was the sixth
+      # and last package in #882.
+      - dependency-name: "pydantic-core"
+
+  # Frontend npm dependencies.
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+    ignore:
+      # @vitejs/plugin-react 6.x peers vite@^8 and we are on vite 6.x, so it can
+      # only sit red. Same rationale as the pandas pin above: revisit as a
+      # dedicated migration, not a dependency bump.
+      #
+      # The jsdom and @testing-library/jest-dom majors used to be ignored here
+      # too, both blocked on Node >=22 while CI and Docker ran Node 20. That
+      # wall is gone — Node 20 reached EOL on 2026-04-30 and the toolchain moved
+      # to Node 22 — so both were taken and the ignores removed rather than left
+      # with a rationale that no longer holds.
+      - dependency-name: "@vitejs/plugin-react"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions workflow pins.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]

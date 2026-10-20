@@ -1,0 +1,89 @@
+services:
+  vibe-trading:
+    build: .
+    ports:
+      - "127.0.0.1:8899:8899"
+    env_file:
+      - agent/.env
+    environment:
+      - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      - VIBE_TW_STOCK_DB=/data/tw-stock/latest.db
+      # Ollama runs on the host; from inside the container "localhost" is the
+      # container itself, so default to reaching the host via host.docker.internal.
+      # Override by exporting OLLAMA_BASE_URL (or setting it in a top-level .env)
+      # when Ollama runs elsewhere or on a different port.
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      # Maps host.docker.internal -> host gateway (needed on Linux; harmless on Docker Desktop).
+      # Requires Docker Engine >= 20.10 / Compose v2 (host-gateway support).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - vibe-runs:/app/agent/runs
+      - vibe-sessions:/app/agent/sessions
+      # User-level agent state: persistent memory, cross-session search index
+      # (sessions.db), user-created skills, shadow accounts, hypothesis
+      # registry, broker connector config, agent.json. Without this volume a
+      # rebuild/recreate wipes it all (#197).
+      - vibe-home:/home/vibe/.vibe-trading
+      - vibe-swarm-runs:/app/agent/.swarm/runs
+      - vibe-uploads:/app/agent/uploads
+      # Persist Web-UI-driven agent/.env edits (_write_env_values in
+      # src/api/helpers.py writes to /app/agent/.env) across container recreation.
+      # env_file above still seeds the initial boot env from the same file.
+      - ./agent/.env:/app/agent/.env
+      # Published Taiwan stock snapshots, mounted read-only. The default host
+      # path stays OUTSIDE the checkout: no market data may ever land in the
+      # working tree. Compose does not expand "~" in volume paths, so this uses
+      # ${HOME}. Override VIBE_TW_STOCK_DATA_DIR in the root .env with another
+      # absolute path outside the repo.
+      - ${VIBE_TW_STOCK_DATA_DIR:-${HOME}/.vibe-trading/tw-stock}:/data/tw-stock:ro
+    # --- Runtime hardening (VT-007) ---
+    cap_drop:
+      - ALL
+    # SETUID/SETGID are kept on purpose: runner.py drops privilege to the
+    # unprivileged vibe-sandbox user for LLM-generated-code subprocesses, which
+    # needs setuid/setgid. They are granted from container start (not gained via
+    # escalation), so no-new-privileges below does not neutralize them.
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
+    # Writable scratch on the read-only rootfs. Named volumes above already
+    # cover agent/runs, agent/sessions, agent/uploads, agent/.swarm/runs and
+    # /home/vibe/.vibe-trading; these tmpfs mounts cover /tmp and the cache dirs
+    # matplotlib/fontconfig write to during PDF rendering.
+    tmpfs:
+      - /tmp
+      - /home/vibe/.cache
+      - /home/vibe/.config
+    # Bound a single runaway backtest. Generous self-hosted defaults; override
+    # in a compose override file for constrained hosts.
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
+    restart: unless-stopped
+
+  frontend:
+    image: node:22@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37  # node:22 digest resolved 2026-07-28
+    working_dir: /app
+    ports:
+      - "127.0.0.1:5899:5899"
+    volumes:
+      - ./frontend:/app
+    environment:
+      - VITE_API_URL=http://vibe-trading:8899
+    command: sh -c "npm install && npm run dev -- --host --port 5899"
+    profiles:
+      - frontend
+    depends_on:
+      vibe-trading:
+        condition: service_started
+
+volumes:
+  vibe-runs:
+  vibe-sessions:
+  vibe-home:
+  vibe-swarm-runs:
+  vibe-uploads:

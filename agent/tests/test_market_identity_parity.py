@@ -1,0 +1,68 @@
+"""Every market the data layer routes is known to identity and symbol search (#1565).
+
+A market is added in ``backtest.engines._market_hooks`` (pattern + currency) and
+the backtest can then price it. The grounding identity layer and symbol search
+keep their own suffix tables, and nothing tied them to that one: ``.L``, ``.VN``
+and ``.BA`` each shipped with no canonical-symbol scan, no venue, no currency,
+and search results labelled ``global``. This test makes the backtest's currency
+table the list, so a new market fails here until it has a row.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from backtest.engines._market_hooks import _MARKET_CURRENCY, _detect_market
+from src.agent.grounding.identity import _infer_currency, _infer_venue, _scan_symbols
+from src.tools.symbol_search_tool import _from_yahoo_symbol
+
+# market -> (project symbol, Yahoo's spelling of it, symbol-search label)
+_SAMPLES: dict[str, tuple[str, str, str]] = {
+    "a_share": ("600519.SH", "600519.SS", "cn"),
+    "us_equity": ("AAPL.US", "AAPL", "us"),
+    "hk_equity": ("00700.HK", "0700.HK", "hk"),
+    "india_equity": ("RELIANCE.NS", "RELIANCE.NS", "in"),
+    "kr_equity": ("005930.KS", "005930.KS", "kr"),
+    "ca_equity": ("TD.TO", "TD.TO", "ca"),
+    "ar_equity": ("GGAL.BA", "GGAL.BA", "ar"),
+    "uk_equity": ("VOD.L", "VOD.L", "uk"),
+    "vietnam_equity": ("VIC.VN", "VIC.VN", "vn"),
+}
+
+# Crypto has a currency row but no listing suffix: its pairs carry the quote.
+_NOT_A_LISTING_MARKET = {"crypto"}
+
+
+def test_every_currency_market_has_a_sample() -> None:
+    assert set(_SAMPLES) == set(_MARKET_CURRENCY) - _NOT_A_LISTING_MARKET
+
+
+@pytest.mark.parametrize("market", sorted(_SAMPLES))
+def test_identity_and_search_know_the_market(market: str) -> None:
+    symbol, yahoo_symbol, label = _SAMPLES[market]
+
+    assert _detect_market(symbol) == market
+    assert _scan_symbols(f"What did {symbol} close at yesterday?") == {symbol}
+    assert _infer_venue(symbol) is not None
+    assert _infer_currency(symbol) == _MARKET_CURRENCY[market]
+    assert _from_yahoo_symbol(yahoo_symbol, {"quoteType": "EQUITY"}) == (symbol, label)
+
+
+def test_a_letter_based_hk_index_is_a_known_hk_listing() -> None:
+    """``HSTECH.HK`` (Hang Seng TECH Index) is an HK identity, not just a code.
+
+    HK indices and named listings carry a word base; the resolver locks them
+    (``market=hk``) while the numeric-only patterns saw nothing, so the whole
+    subject of an HK-index answer was misattributed to a speaker's fund
+    (2026-10-12 run). Engine classifier, identity scan and venue/currency must
+    all agree — hence this parity check.
+    """
+    assert _detect_market("HSTECH.HK") == "hk_equity"
+    assert _scan_symbols("HSTECH.HK 收盘距 SMA20 多远？") == {"HSTECH.HK"}
+    assert _infer_venue("HSTECH.HK") == "hong_kong"
+    assert _infer_currency("HSTECH.HK") == "HKD"
+
+
+def test_a_hk_url_host_is_not_read_as_a_listing() -> None:
+    """``.hk`` is a real TLD: a ``…com.hk`` source host must not become a symbol."""
+    assert _scan_symbols("来源 https://www.example.com.hk/news") == set()

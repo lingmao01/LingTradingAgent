@@ -1,0 +1,18 @@
+# Channel SDK dependencies baked into the Docker image.
+#
+# Mirrors the [feishu] and [telegram] extras in pyproject.toml — keep the two in
+# sync. They live in a separate lock rather than being resolved at build time
+# because `pip install -e ".[extras]"` downloads whatever PyPI currently serves,
+# with no hashes, which would defeat the hash-pinned contract the runtime image
+# is built on.
+#
+# Regenerate the lock (Python 3.11, matching requirements-lock.txt) with:
+#
+#    pip-compile --allow-unsafe --generate-hashes \
+#      --constraint requirements-lock.txt \
+#      --output-file=requirements-channels-lock.txt \
+#      agent/requirements-channels.txt
+#
+lark-oapi>=1.4.0
+qrcode>=7.4.2
+python-telegram-bot>=21.0

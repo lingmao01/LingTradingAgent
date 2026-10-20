@@ -1,0 +1,179 @@
+.venv/
+agent/.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Coverage reports
+.coverage
+coverage.xml
+
+# Node dependencies (root level)
+node_modules/
+
+# Backtest output artifacts
+results/
+
+.env
+agent/.env
+
+.claude/*
+!.claude/hooks.json
+CLAUDE.md
+.vscode/
+learn-claude-code-main/
+agent/sessions/
+agent/runs/
+agent/.ui_runtime/
+agent/.tasks/
+agent/uploads/
+# The same runtime artifacts, written to the repo root whenever the runtime
+# root resolves here — which it does for anyone whose shell exports
+# VIBE_TRADING_HOME as this checkout, and for a CLI or server started from it.
+#
+# This list is the set of children `get_runtime_root()` can create; keep it
+# closed against `agent/src/config/paths.py` and the connector `sdk.py`
+# CONFIG_FILENAME sites rather than adding entries one incident at a time.
+# It was built that way and had gaps: /swarm/runs/ was ignored while /swarm/
+# was not, and workspace/ — created by get_workspace_path() on any channel
+# adapter import — was not covered at all. Several of these carry secrets
+# (auth/ holds the Codex token, connectors/ and connections.json hold broker
+# credentials) or tamper-evident state (live/ holds the hash-chained audit
+# ledger), so a stray `git add -A` here is a credential leak, not just noise.
+# The per-broker config files below were missing until 2026-09-11 even though
+# this comment already claimed them; agent/tests/test_gitignore_runtime_files.py
+# now derives the filename constants from the code and fails on any gap.
+# The structured config (agent.json and its YAML twins) was missed the same
+# way until 2026-09-21: it holds IM channel credentials that the Feishu QR
+# login and the channel settings routes write here.
+/agent.json
+/agent.yaml
+/agent.yml
+/sessions.db
+/sessions.db-shm
+/sessions.db-wal
+/sessions/
+/runs/
+/shadow_runs/
+/shadow_accounts/
+/swarm/
+/live/
+/uploads/
+/imports/
+/workspace/
+/auth/
+/connectors/
+/portfolio/
+/scheduled_research/
+/memory/
+/memory_index/
+/cache/
+/data/
+/reports/
+/hypotheses/
+/history/
+/pairing/
+/connections.json
+/trading-connections.json
+/portfolio.json
+/position_book.json
+/advice_journal.json
+/risk_rules.json
+/config.yaml
+/swarm-agent.json
+/strategy_discovery.db
+/alpaca.json
+/binance.json
+/dhan.json
+/etoro.json
+/futu.json
+/ibkr-local.json
+/kis.json
+/kis-token-*.json
+/longbridge.json
+/mt5.json
+/okx.json
+/shoonya.json
+/tiger.json
+/toss.json
+/toss-token.json
+/trading212.json
+/upbit.json
+/zerodha.json
+agent/tests/*_result.json
+.ruff_cache/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+wiki/node_modules/
+wiki/dist/
+wiki/.astro/
+wiki/.vite/
+wiki/.wrangler/
+.wrangler/
+wiki/.cache/
+.vibe-dev/
+.vibe-record/
+.cache/
+.remotion/
+
+# DuckDB data cache
+data/*.duckdb
+data/*.duckdb.wal
+data/.duckdb_tmp/
+data/parquet/
+data/backup/
+
+# Internal docs (plans, specs)
+docs/
+!wiki/docs/
+!wiki/docs/**
+docs/screenshots/agent-run.png
+docs/screenshots/boot.png
+data/minutes/
+data/overnight*.log
+data/*.log
+data/test_write.txt
+agent/.pytest_tmp/
+agent/.pytest-tmp/
+agent/vibe_trading.egg-info/
+agent/vibe_trading_ai.egg-info/
+agent/tests/e2e_backtest/
+dist/
+build/
+
+# Local demo videos (too large for git; link to external host instead)
+assets/*.mp4
+
+# Local demo / promo production workspace
+demo/
+
+# Manual E2E smoke tests — require live API keys (OpenRouter / yfinance),
+# would break CI if committed. Kept local; run explicitly when validating
+# a release.
+agent/tests/e2e_*.py
+agent/tests/test_e2e_*.py
+
+# Local working notes
+NOTES.md
+.workbuddy/
+
+# Agent tool aliases (auto-generated mirror of CLAUDE.md)
+AGENTS.md
+
+.DS_Store
+
+# Desktop shell build outputs
+desktop/electron/node_modules/
+desktop/electron/dist/
+desktop/electron/.cache/
+desktop/electron/release/
+desktop/electron/runtime/
+
+# Alpha Zoo wiki artifacts (generated, not source)
+wiki/alpha-library/manifest.json
+wiki/alpha-library/content/
+bench_report.json
+
+# Grounding ledger persisted by ad-hoc verification scripts into tests/
+agent/tests/artifacts/
+.idea/*
